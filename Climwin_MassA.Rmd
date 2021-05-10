@@ -1,0 +1,1427 @@
+---
+title: "Climwin_MassA.Rmd"
+author: "Ivan Bizberg"
+date: "10/25/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r, global-options, include=FALSE}
+knitr::opts_chunk$set(fig.height = 10, fig.width = 15, error = FALSE)
+```
+
+Libraries
+```{r message=FALSE, warning=FALSE}
+# Data wrangling
+library(tidyverse)
+library(lubridate)
+library(magrittr)
+# Analisis
+library(climwin)
+library(lme4)
+# Model selection
+library(MuMIn)
+library(bbmle)
+library(performance)
+# Plotting
+library(ggthemes)
+library(effects)
+library(Greg)
+library(rms)
+library(kableExtra)
+```
+
+```{r}
+path = "conducta"
+setwd(str_glue("C:/Users/{path}/Dropbox/PHD/Git/Climwin_MassA"))
+getwd()
+```
+
+
+```{r}
+# Climatic data
+ClimData = read.csv(str_glue("C:/Users/{path}/Dropbox/PHD/DATA/ClimateVariables4.0.csv"), sep = ",", 
+                    header = T,stringsAsFactors = F) %>% 
+  mutate(Chl = if_else(abs(Chl) > mean(Chl, na.rm = T)+3*sd(Chl, na.rm = T), NA_real_, Chl)) %>% 
+  mutate(Area_Rain = if_else(abs(Area_Rain) > mean(Area_Rain, na.rm = T)+3*sd(Area_Rain, na.rm = T), NA_real_, Area_Rain)) %>% 
+  rename(Date = time) %>% mutate(Date = ymd(Date)) %>% mutate(SST = as.numeric(SST))
+```
+
+
+```{r}
+# Biological data
+MotherBio <- read.csv(str_glue("C:/Users/{path}/Dropbox/PHD/DATA/RawData4.5.csv"),sep =",",
+                 header = T, stringsAsFactors = F) %>% rename(Clutch = PUESTA, Brood = NIDADA)
+```
+
+```{r}
+# Fix data
+BioData <- MotherBio %>% #select(sort(colnames(.))) %>% 
+  filter(SEMANIPULO == "f") %>%
+  # Remove data errors and birds that were measure before their time
+  filter(!((LastAge1 %in% c(-50 : 65)))) %>% # Remove birds that where measure before 70 days
+  mutate_at(vars(ESTECLOS1, ESTECLOS2, ESTECLOS3), ymd) %>% 
+  mutate(DATE1 = ESTECLOS1 + 70) %>% 
+  mutate(DATE2 = ESTECLOS2 + 70) %>% 
+  mutate(DATE3 = ESTECLOS3 + 70) %>% 
+  filter(!Nest_OrderFemale %in% c(2,3)) %>% # Remove females re-nests
+  select(WORKYEAR, NIDO, PROPORTIONALRANK, LayRank, HatchRank, CoupleExpLocal, Clutch, Brood, 
+         EstHatchAsynchro12_, EstHatchAsynchro13_, EstHatchAsynchro23_,
+         CondCohabtime1, CondCohabtime2, CondCohabtime3,
+         CONFIRMHEMB, CONFIRMMACH,
+         contains(c("ANILLO","AGE")), ends_with(c("1", "2", "3")), 
+         -contains(c("90", "HERIDO", "DISTANCIA", "SENCONTRO"))) %>% 
+  mutate_all(as.character) %>% 
+  pivot_longer(cols = all_of(ends_with(c("1","2","3"))), 
+               names_to = c("columns", "ChickRank"), 
+               names_pattern = "(.*)(.)") %>% 
+  pivot_wider(names_from = "columns")
+
+FixBioData <- BioData %>% mutate_at(vars(DATE), ymd) %>% 
+  mutate_at(vars(BodyCondSMI, PESO70, WORKYEAR, LastAge),as.numeric) %>% 
+  filter(ChickRank == "1") %>% 
+  filter(!(abs(PESO70)>mean(PESO70, na.rm = T)+3*sd(PESO70, na.rm = T))) %>%
+  mutate(ULNA70 = as.numeric(ULNA70)) %>% 
+  filter(!(abs(ULNA70)>mean(ULNA70, na.rm = T)+3*sd(ULNA70, na.rm = T))) 
+
+boxplot(FixBioData$PESO70) # check outliers 
+write_csv(FixBioData, "ClimWinBodyCond_1.csv")
+```
+
+### Import created data
+```{r, results=FALSE}
+FixedBioData <- read_csv("ClimWinBodyCond_1.csv")
+ClimBioData <- FixedBioData %>%
+  select(WORKYEAR, NIDO, ChickRank, LastAge, DATE, PESO70, BodyCondSMI, Brood, ULNA70) %>% 
+  na.omit()
+
+```
+
+
+# Climwin chicks 1
+
+# Finding window for chlorophyll-a
+
+```{r message=FALSE, warning=FALSE}
+Bio <- ClimBioData %>% filter(DATE >= "2003-05-01") %>%
+  mutate_at(vars(WORKYEAR), as.factor) %>% 
+  na.omit()
+```
+
+```{r}
+Clim = ClimData %>% select(Date , Chl) %>%
+  # filter(!Chl > 70) %>% # remove one oultlier
+  na.omit()
+```
+
+##Climwin analysis
+
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimWin <- slidingwin(xvar = list(ClimVar = Clim$Chl), # Climatic variable
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(15, 0),
+                      type = "relative",
+                      stat = c("sum", "max", "min"),
+                      func = c("quad", "lin"),
+                      cmissing = "method1")
+
+```
+### Results
+
+```{r}
+Comb <- (ClimWin$combos) %>% rownames_to_column() %>% arrange((DeltaAICc)) ; as.data.frame(Comb)
+```
+```{r}
+n <- Comb %>% .[[1,1]] %>% as.numeric()
+tidy_stat = Comb %>% .[[1, 5]] %>% as.character()
+tidy_func = Comb %>% .[[1, 6]] %>% as.character()
+Results = ClimWin[[n]]$Dataset ; head(Results, n = 4)
+```
+```{r fig.height = 5, fig.width = 8, fig.align="center"}
+plotdelta(dataset = Results)
+```
+
+#### Extract data Chl
+```{r}
+ClimVar <- "Chl"
+ClimateData = ClimWin[[n]]$BestModelData; head(ClimateData)
+ExtractedData = ClimateData %>% select(contains("climate")) %>% rename(!!ClimVar := climate) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^2\\)")), ~ paste0(ClimVar, "_2")) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^3\\)")), ~ paste0(ClimVar, "_3")) %>% 
+  bind_cols(Bio)
+write_csv(ExtractedData, str_glue("WinBodyCond{ClimVar}.csv"))
+```
+## Randomization
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimRand <- randwin(repeats = 16,
+                    xvar = list(ClimVar = Clim$Chl),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(15, 0),
+                    type = "relative",
+                    stat = tidy_stat,
+                    func = tidy_func,
+                    cmissing = "method1")
+```
+
+
+
+### Results of randomization
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+ClimWinRand = ClimRand[[1]]
+
+# Diagnostic Plots
+
+pvalue(Results, ClimWinRand, metric = "AIC", sample.size = 16)
+
+plothist(Results, ClimWinRand)
+
+```
+
+
+
+# Data Bio 1989
+```{r}
+# Biological data
+Bio = ClimBioData %>% filter(WORKYEAR > "1989") %>%
+  mutate_at(vars(WORKYEAR), as.factor) %>% 
+  na.omit()
+```
+
+# Finding window for SST
+```{r}
+# Climatic data
+Clim <- ClimData %>% select(Date , SST) %>%
+  na.omit()
+```
+
+##Climwin analysis
+
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimWin <- slidingwin(xvar = list(ClimVar = Clim$SST), # Climatic variable
+                      bdate = Bio$DATE,
+                      cdate = Clim$Date,
+                      baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(17, 0),
+                      type = "relative",
+                      stat = c("mean", "max", "min"),
+                      func = c("quad", "lin"),
+                      cmissing = "method1")
+```
+### Results
+
+```{r}
+Comb = (ClimWin$combos) %>% rownames_to_column() %>% arrange((DeltaAICc)); as.data.frame(Comb)
+```
+
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+n = Comb %>% .[[1,1]] %>% as.numeric()
+tidy_stat = Comb %>% .[[1, 5]] %>% as.character()
+tidy_func = Comb %>% .[[1, 6]] %>% as.character()
+Results = ClimWin[[n]]$Dataset ; head(Results, n = 4)
+```
+```{r}
+plotdelta(dataset = Results)
+```
+
+#### Extract data SST
+```{r}
+ClimVar = "SST"
+ClimateData = ClimWin[[n]]$BestModelData; head(ClimateData)
+ExtractedData = ClimateData %>% select(contains("climate")) %>% rename(!!ClimVar := climate) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^2\\)")), ~ paste0(ClimVar, "_2")) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^3\\)")), ~ paste0(ClimVar, "_3")) %>% 
+  bind_cols(Bio)
+write_csv(ExtractedData, str_glue("WinBodyCond{ClimVar}.csv"))
+```
+
+## Randomization
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimRand <- randwin(repeats = 16,
+                    xvar = list(ClimVar = Clim$SST),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(17, 0),
+                    type = "relative",
+                    stat = tidy_stat,
+                    func = tidy_func,
+                    cmissing = "method1")
+```
+
+
+
+### Results of randomization
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+ClimWinRand = ClimRand[[1]]
+
+# Diagnostic Plots
+
+pvalue(Results, ClimWinRand, metric = "AIC", sample.size = 29)
+
+plothist(Results, ClimWinRand)
+
+```
+
+
+
+# Finding window for Wind
+
+```{r}
+# Climatic data
+Clim = ClimData %>%
+  select(Date , Wind) %>%
+  na.omit()
+```
+
+##Climwin analysis Wind
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimWin <- slidingwin(xvar = list(ClimVar = Clim$Wind), # Climatic variable
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(17, 0),
+                      type = "relative",
+                      stat = c("min", "max", "mean"),
+                      func = c("lin", "quad"),
+                      cmissing = "method1")
+```
+
+### Results
+
+```{r}
+Comb = (ClimWin$combos) %>% add_rownames() %>% arrange((DeltaAICc)); as.data.frame(Comb)
+```
+
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+n = Comb %>% .[[1,1]] %>% as.numeric()
+tidy_stat = Comb %>% .[[1, 5]] %>% as.character()
+tidy_func = Comb %>% .[[1, 6]] %>% as.character()
+Results = ClimWin[[n]]$Dataset ; head(Results, n = 4)
+```
+```{r}
+plotdelta(dataset = Results)
+```
+
+#### Extract data Wind
+```{r}
+ClimVar = "Wind"
+ClimateData = ClimWin[[n]]$BestModelData; head(ClimateData)
+ExtractedData = ClimateData %>% select(contains("climate")) %>% rename(!!ClimVar := climate) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^2\\)")), ~ paste0(ClimVar, "_2")) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^3\\)")), ~ paste0(ClimVar, "_3")) %>% 
+  bind_cols(Bio)
+write_csv(ExtractedData, str_glue("WinBodyCond{ClimVar}.csv"))
+```
+## Randomization
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimRand <- randwin(repeats = 15,
+                    xvar = list(ClimVar = Clim$Wind),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(17, 0),
+                    type = "relative",
+                    stat = tidy_stat,
+                    func = tidy_func,
+                    cmissing = "method1")
+```
+
+
+
+### Results of randomization
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+ClimWinRand = ClimRand[[1]]
+
+# Diagnostic Plots
+
+pvalue(Results, ClimWinRand, metric = "AIC", sample.size = 29)
+
+plothist(Results, ClimWinRand)
+
+```
+
+# Finding window for Rain 
+
+```{r}
+# Climatic data
+Clim = ClimData %>%
+  select(Date , Rain, NdaysRain) %>%
+  na.omit()
+```
+
+## Climwin analysis Rain
+
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimWin <- slidingwin(xvar = list(ClimVar = Clim$Rain), # Climatic variable
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(20, 0),
+                      type = "relative",
+                      stat = c("sum", "max"), # error with min
+                      func = c("quad", "lin"),
+                      cmissing = "method1")
+```
+
+### Results
+
+```{r}
+Comb = (ClimWin$combos) %>% add_rownames() %>% arrange((DeltaAICc)); as.data.frame(Comb)
+```
+
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+n = Comb %>% .[[1,1]] %>% as.numeric()
+tidy_stat = Comb %>% .[[1, 5]] %>% as.character()
+tidy_func = Comb %>% .[[1, 6]] %>% as.character()
+Results = ClimWin[[n]]$Dataset ; head(Results, n = 4)
+```
+```{r}
+plotdelta(dataset = Results)
+```
+
+#### Extract data Rain
+```{r}
+ClimVar = "Rain"
+ClimateData = ClimWin[[n]]$BestModelData; head(ClimateData)
+ExtractedData = ClimateData %>% select(contains("climate")) %>% rename(!!ClimVar := climate) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^2\\)")), ~ paste0(ClimVar, "_2")) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^3\\)")), ~ paste0(ClimVar, "_3")) %>% 
+  bind_cols(Bio)
+write_csv(ExtractedData, str_glue("WinBodyCond{ClimVar}.csv"))
+```
+## Randomization
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimRand <- randwin(repeats = 16,
+                    xvar = list(ClimVar = Clim$Rain),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(20, 0),
+                    type = "relative",
+                    stat = tidy_stat,
+                    func = tidy_func,
+                    cmissing = "method1")
+```
+
+
+### Results of randomization
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+ClimWinRand = ClimRand[[1]]
+
+# Diagnostic Plots
+
+pvalue(Results, ClimWinRand, metric = "AIC", sample.size = 29)
+
+plothist(Results, ClimWinRand)
+
+```
+
+
+# Finding window for Area_Rain
+
+```{r}
+# Climatic data
+Clim = ClimData %>%
+  select(Date, Area_Rain, NdaysArea_Rain, NdaysArea_RainMedium) %>%
+  na.omit()
+```
+
+##Climwin analysis 
+
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimWin <- slidingwin(xvar = list(ClimVar = Clim$Area_Rain), # Climatic variable
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio,
+                                      control=lmerControl(optimizer="bobyqa",
+                                                          optCtrl=list(maxfun=2e6))),
+                      cinterval = "week",
+                      range = c(21, 0),
+                      type = "relative",
+                      stat = c("max", "sum"), # error with min convergence with sum/quad (but fixed with bobyqa)
+                      func = c("lin", "quad"), # Can't use log and inv because of zeros
+                      cmissing = "method1")
+```
+
+### Results
+
+```{r}
+Comb = (ClimWin$combos) %>% add_rownames() %>% arrange((DeltaAICc)); as.data.frame(Comb)
+```
+
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+n = Comb %>% .[[1,1]] %>% as.numeric()
+tidy_stat = Comb %>% .[[1, 5]] %>% as.character()
+tidy_func = Comb %>% .[[1, 6]] %>% as.character()
+Results = ClimWin[[n]]$Dataset ; head(Results, n = 4)
+```
+```{r}
+plotdelta(dataset = Results)
+```
+#### Extract data Area_Rain
+```{r}
+ClimVar = "Area_Rain"
+ClimateData = ClimWin[[n]]$BestModelData; head(ClimateData)
+ExtractedData = ClimateData %>% select(contains("climate")) %>% rename(!!ClimVar := climate) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^2\\)")), ~ paste0(ClimVar, "_2")) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^3\\)")), ~ paste0(ClimVar, "_3")) %>% 
+  bind_cols(Bio)
+write_csv(ExtractedData, str_glue("WinBodyCond{ClimVar}.csv"))
+```
+## Randomization
+```{r message=FALSE, results=FALSE, cache=TRUE, warning=FALSE}
+ClimRand <- randwin(repeats = 16,
+                    xvar = list(ClimVar = Clim$Area_Rain),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70 ~ ULNA70 + (1|WORKYEAR), REML = F, data = Bio, 
+                                    control=lmerControl(optimizer="bobyqa",
+                                                          optCtrl=list(maxfun=2e6))),
+                    cinterval = "week",
+                    range = c(21, 0),
+                    type = "relative",
+                    stat = tidy_stat,
+                    func = tidy_func,
+                    cmissing = "method1")
+```
+
+
+
+### Results of randomization
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+ClimWinRand = ClimRand[[1]]
+
+# Diagnostic Plots
+
+pvalue(Results, ClimWinRand, metric = "AIC", sample.size = 29)
+
+plothist(Results, ClimWinRand)
+
+```
+
+# Compile new data
+```{r, results=FALSE, warning=FALSE}
+Chl <- read_csv("WinBodyCondChl.csv") %>% select(1:2, NIDO, WORKYEAR) 
+SST <- read_csv("WinBodyCondSST.csv") %>% select(1:2, NIDO, WORKYEAR) 
+Area_Rain <- read_csv("WinBodyCondArea_Rain.csv") %>% select(1:2, NIDO, WORKYEAR) 
+
+Mother <- read_csv("ClimWinBodyCond_1.csv")
+
+FinalData <- plyr::join_all(list(Mother, Chl, SST, Area_Rain), by = c("NIDO", "WORKYEAR"), type = "left") 
+write_csv(FinalData, "DATAWinBodyCond_1.csv")
+```
+
+
+
+
+
+
+
+
+
+# Which variable need to be refitted?
+```{r}
+Final_Data = read.csv("DATAWinBodyCond_1.csv")
+
+LmmData = Final_Data %>%  
+  # filter(CONFIRMHEMB == "TRUE") %>%
+  mutate_at(vars(PROPORTIONALRANK, BodyCondSMI, Brood, Chl, SST, Area_Rain, CondCohabtime, 
+                 AGEHEMB, AGEMACH),
+            arm::rescale) %>% 
+  select(WORKYEAR, 
+         # ANILLOMACH, AGEMACH,
+         # ANILLOHEMB, AGEHEMB,
+         # CoupleExpLocal,
+         # CondCohabtime,
+         BodyCondSMI,
+         # PROPORTIONALRANK, 
+         Brood, Chl, SST, Area_Rain) %>% na.omit()
+```
+
+```{r}
+Bestcond <- lmer(
+  BodyCondSMI ~ #Brood +
+    # CoupleExpLocal +
+    # CondCohabtime +
+    # PROPORTIONALRANK + 
+    Chl + 
+    I(Chl^2) + 
+    SST + 
+    I(SST^2) + 
+    Area_Rain +
+    I(Area_Rain^2) +
+    # AGEHEMB +
+    # I(AGEHEMB^2) +
+    (1 | WORKYEAR), #+ (1|ANILLOHEMB),
+  REML = FALSE,
+  data = LmmData) 
+
+sjPlot::tab_model(Bestcond)
+```
+We need to refit signals relevant for body Condition in this case we have Chl, SST, Wind, NArea_Rain 
+```{r}
+# Check vif
+check_collinearity(Bestcond)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Refiting Variables (Chl_2, SST_2, Area_Rain_2, Wind)
+### Data For refitting
+```{r, message=FALSE}
+BioData = read_csv(str_glue("DATAWinBodyCond_1.csv")) %>% 
+  select(WORKYEAR, NIDO, ChickRank, LastAge, DATE, PESO70, BodyCondSMI, Brood, ULNA70, 59 : 64) %>% glimpse()
+```
+
+```{r}
+# Climatic data
+ClimData = read.csv(str_glue("C:/Users/{path}/Dropbox/PHD/DATA/ClimateVariables4.0.csv"), sep = ",", 
+                    header = T,stringsAsFactors = F) %>% 
+  mutate(Chl = if_else(abs(Chl) > mean(Chl, na.rm = T)+3*sd(Chl, na.rm = T), NA_real_, Chl)) %>% 
+  mutate(Area_Rain = if_else(abs(Area_Rain) > mean(Area_Rain, na.rm = T)+3*sd(Area_Rain, na.rm = T), NA_real_, Area_Rain)) %>% 
+  rename(Date = time) %>% mutate(Date = ymd(Date)) %>% mutate(SST = as.numeric(SST))
+```
+
+# Reffiting Chlorophyll-a
+```{r}
+Bio = BioData %>% filter(DATE >= "2003-05-01") %>%
+  mutate(across(c(WORKYEAR), as.factor)) %>% 
+  # mutate(across(c(where(is.numeric), -ChickRank), arm::rescale)) %>% # If we want to rescale but don't make any diference
+  na.omit() %>% glimpse()
+```
+ 
+```{r}
+# Impute manually missing data 
+Missing <- c("35/2007", "18/2011", "36/2013", "37/2014", "45/2014", "42/2018")
+
+Missing_data <- as.Date(paste0('1/', Missing), '%u/%U/%Y')
+
+Clim = ClimData %>% select(Date , Chl) %>% drop_na() %>% 
+  rbind(., data.frame(Date = Missing_data, Chl = NA)) %>% # add missing values 
+  arrange(Date) %>% 
+  mutate(Chl = if_else(is.na(Chl), (lag(Chl,1) + lead(Chl,1) + lag(Chl, 2) + lead(Chl, 2))/4, Chl)) %>% 
+  distinct(Date, .keep_all = T)
+
+```
+
+##Climwin analysis
+
+```{r, message=FALSE, results=FALSE, warning=FALSE, cache=TRUE}
+ClimWin <- slidingwin(xvar = list(ClimVar = Clim$Chl), # Climatic variable
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70 ~ ULNA70 + SST_2 + Area_Rain_2 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(15, 0),
+                      type = "relative",
+                      stat = c("min", "max", "sum"),
+                      func = c("quad", "lin"),
+                      cmissing = "method1")
+```
+
+### Results
+
+```{r}
+Comb = (ClimWin$combos) %>% rownames_to_column() %>% arrange((DeltaAICc)) ; as.data.frame(Comb)
+```
+
+
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+n = Comb %>% .[[1,1]] %>% as.numeric()
+tidy_stat = Comb %>% .[[1, 5]] %>% as.character()
+tidy_func = Comb %>% .[[1, 6]] %>% as.character()
+Results = ClimWin[[n]]$Dataset ; head(Results, n = 4)
+```
+```{r}
+plotdelta(dataset = Results)
+```
+#### Average results
+```{r}
+medwin(ClimWin[[n]]$Dataset) # calculate mean open window and mean close window from the best model base on the 95% confidence 
+
+dataset <- ClimWin[[n]]$Dataset
+
+ConfidenceSet <- dataset[which(cumsum(dataset$ModWeight) <= 0.95), ]
+
+sum(ConfidenceSet$ModelBeta*ConfidenceSet$ModWeight)
+```
+
+#### Extract data RefittedChl
+```{r}
+ClimVar = "RefittedChl"
+ClimateData = ClimWin[[n]]$BestModelData; head(ClimateData)
+Area_RainData = ClimateData %>% select(contains("climate")) %>% rename(!!ClimVar := climate) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^2\\)")), ~ paste0(ClimVar, "_2")) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^3\\)")), ~ paste0(ClimVar, "_3")) %>% 
+  bind_cols(Bio)
+write_csv(Area_RainData, str_glue("WinBodyCond{ClimVar}.csv"))
+```
+## Randomization
+```{r, message=FALSE, results=FALSE, warning=FALSE, cache=TRUE}
+ClimRand <- randwin(repeats = 15,
+                    xvar = list(ClimVar = Clim$Chl),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70 ~ ULNA70 + SST_2 + Area_Rain_2 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(15, 0),
+                    type = "relative",
+                    stat = tidy_stat,
+                    func = tidy_func,
+                    cmissing = "method1")
+```
+
+
+
+### Results of randomization
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+ClimWinRand = ClimRand[[1]]
+
+# Diagnostic Plots
+
+pvalue(Results, ClimWinRand, metric = "C", sample.size = 16)
+
+plothist(Results, ClimWinRand)
+
+```
+## Weight Chl
+```{r, eval=TRUE, cache=TRUE, results="hide", message=FALSE}
+# Bio_Scale <- Bio %>% mutate(across(c(HatchAsync, PROPORTIONALRANK, SST_2), scale))
+# Clim_Scale <- Clim %>% mutate(across(c(Chl), scale))
+dev.new(noRStudioGD = T)
+weight <- weightwin(n = 15,
+                    xvar = list(ClimVar = Clim$Chl),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70~ ULNA70 + SST_2 + Area_Rain_2 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(15, 0),
+                    type = "relative",
+                    func = tidy_func,
+                    weightfunc = "W",
+                    cmissing = "method1",
+                    par = c(3, 0.2, 0))
+```
+#### Weight Chl results
+```{r}
+Weight_results <- weight$iterations %>% rownames_to_column() %>% arrange(deltaAICc); Weight_results # Show iteration results 
+n <- Weight_results[1, 1] %>% as.numeric()
+Best_iter <- weight[[n]]$WeightedOutput; Best_iter # Best model interation
+```
+
+
+```{r, warning=FALSE}
+plot(weight[[10]]$Weights, type = "line")
+```
+We need to compare the AIC from the slidingwin function and from the weightwin to see with function explain better the variation in brood reduction either a weight with uniform distribution or a weight with Weibull distribution. 
+Here we can se that the better model is with _..._ function
+
+### Randomization weight
+```{r, eval=TRUE, cache=TRUE, results="hide", message=FALSE}
+dev.new(noRStudioGD = T)
+WeightRand <- randwin(repeats = 15,
+                      window = "weighted",
+                      xvar = list(ClimVar = Clim$Chl),
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70~ ULNA70 + SST_2 + Area_Rain_2 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(15, 0),
+                      type = "relative",
+                      func = tidy_func,
+                      cmissing = "method1",
+                      weightfunc = "W", par = c(3, 0.2, 0))
+
+```
+#### Results weight
+```{r}
+pvalue(dataset = weight[[n]]$WeightedOutput, datasetrand = WeightRand[[1]], metric = "AIC")
+```
+
+
+# Reffiting SST
+
+```{r}
+Missing <- c("33/1988", "37/1991", "37/1992", "41/1994", "15/1997", "18/2001", 
+             "50/2001", "16/2002", "35/2004", "5/2012", "50/2012", "8/2013", 
+             "36/2013", "51/2017")
+Clim = ClimData %>% select(Date , SST) %>%
+  #Imput manually data for 6 missing weeks 
+  mutate(Weeks = week(Date)) %>% 
+  mutate(Days = day(Date)) %>% 
+  mutate(Year = year(Date)) %>% 
+  mutate(Weeks_Year = paste0(.$Weeks, "/", .$Year)) %>% 
+  filter(!(is.na(SST) & !Weeks_Year %in% Missing)) %>% 
+  group_by(Weeks_Year) %>% mutate(n = 1, n = cumsum(n)) %>% ungroup() %>% 
+  filter(!(n > 1 & is.na(SST))) %>% select(-n) %>% # Remove duplicate when SST is NA
+  # manual cmissing = method1 (input with the mean of 2 last and 2 forward observations)
+  arrange(Date) %>% 
+  mutate(SST = if_else(
+    is.na(SST),
+    (lag(SST,1) + lead(SST,1) + lag(SST, 2) + lead(SST, 2))/4,
+    SST
+  )) %>% 
+  filter(!SST < 5) %>% # Outliers where check
+  select(Date , SST)
+```
+
+##Climwin analysis
+
+```{r, message=FALSE, results=FALSE, warning=FALSE, cache=TRUE}
+ClimWin <- slidingwin(xvar = list(ClimVar = Clim$SST), # Climatic variable
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70 ~ ULNA70 + Chl_2 + Area_Rain_2 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(15, 0),
+                      type = "relative",
+                      stat = c("min", "max", "mean"),
+                      func = c("quad", "lin"),
+                      cmissing = "method1")
+```
+
+### Results
+
+```{r}
+Comb = (ClimWin$combos) %>% rownames_to_column() %>% arrange((DeltaAICc)); as.data.frame(Comb)
+```
+
+
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+n = Comb %>% .[[1,1]] %>% as.numeric()
+tidy_stat = Comb %>% .[[1, 5]] %>% as.character()
+tidy_func = Comb %>% .[[1, 6]] %>% as.character()
+Results = ClimWin[[n]]$Dataset ; head(Results, n = 4)
+```
+```{r}
+plotdelta(dataset = Results)
+```
+#### Average results
+```{r}
+medwin(ClimWin[[n]]$Dataset) # calculate mean open window and mean close window from the best model base on the 95% confidence 
+
+dataset <- ClimWin[[n]]$Dataset
+
+ConfidenceSet <- dataset[which(cumsum(dataset$ModWeight) <= 0.95), ]
+
+sum(ConfidenceSet$ModelBeta*ConfidenceSet$ModWeight)
+```
+#### Extract data RefittedSST
+```{r}
+ClimVar = "RefittedSST"
+ClimateData = ClimWin[[n]]$BestModelData; head(ClimateData)
+Area_RainData = ClimateData %>% select(contains("climate")) %>% rename(!!ClimVar := climate) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^2\\)")), ~ paste0(ClimVar, "_2")) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^3\\)")), ~ paste0(ClimVar, "_3")) %>% 
+  bind_cols(Bio)
+write_csv(Area_RainData, str_glue("WinBodyCond{ClimVar}.csv"))
+```
+## Randomization
+```{r, message=FALSE, results=FALSE, warning=FALSE, cache=TRUE}
+ClimRand <- randwin(repeats = 15,
+                    xvar = list(ClimVar = Clim$SST),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70 ~ ULNA70 + Chl_2 + Area_Rain_2 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(15, 0),
+                    type = "relative",
+                    stat = tidy_stat,
+                    func = tidy_func,
+                    cmissing = "method1")
+```
+
+
+
+### Results of randomization
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+ClimWinRand = ClimRand[[1]]
+
+# Diagnostic Plots
+
+pvalue(Results, ClimWinRand, metric = "C", sample.size = 16)
+
+plothist(Results, ClimWinRand)
+
+```
+
+## Weight SST
+```{r, eval=TRUE, cache=TRUE, results="hide", message=FALSE}
+# Bio_Scale <- Bio %>% mutate(across(c(HatchAsync, PROPORTIONALRANK, SST_2), scale))
+# Clim_Scale <- Clim %>% mutate(across(c(Chl), scale))
+dev.new(noRStudioGD = T)
+weight <- weightwin(n = 15,
+                    xvar = list(ClimVar = Clim$SST),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70~ ULNA70 + Chl_2 + Area_Rain_2 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(15, 0),
+                    type = "relative",
+                    func = tidy_func,
+                    weightfunc = "W",
+                    cmissing = "method1",
+                    par = c(3, 0.2, 0))
+```
+#### Weight SST results
+```{r}
+Weight_results <- weight$iterations %>% rownames_to_column() %>% arrange(deltaAICc); Weight_results # Show iteration results 
+n <- Weight_results[1, 1] %>% as.numeric()
+Best_iter <- weight[[n]]$WeightedOutput; Best_iter # Best model interation
+```
+
+
+```{r, warning=FALSE}
+plot(weight[[10]]$Weights, type = "line")
+```
+We need to compare the AIC from the slidingwin function and from the weightwin to see with function explain better the variation in brood reduction either a weight with uniform distribution or a weight with Weibull distribution. 
+Here we can se that the better model is with _..._ function
+
+### Randomization weight
+```{r, eval=TRUE, cache=TRUE, results="hide", message=FALSE}
+dev.new(noRStudioGD = T)
+WeightRand <- randwin(repeats = 15,
+                      window = "weighted",
+                      xvar = list(ClimVar = Clim$SST),
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70~ ULNA70 + Chl_2 + Area_Rain_2 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(15, 0),
+                      type = "relative",
+                      func = tidy_func,
+                      cmissing = "method1",
+                      weightfunc = "W", par = c(3, 0.2, 0))
+
+```
+#### Results weight
+```{r}
+pvalue(dataset = weight[[n]]$WeightedOutput, datasetrand = WeightRand[[1]], metric = "AIC")
+```
+
+
+
+
+# Reffiting Area rain
+
+```{r}
+Clim = ClimData %>% select(Date , Area_Rain) %>%
+  na.omit()
+```
+
+## Climwin analysis
+
+```{r, message=FALSE, results=FALSE, warning=FALSE, cache=TRUE}
+ClimWin <- slidingwin(xvar = list(ClimVar = Clim$Area_Rain), # Climatic variable
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70 ~ ULNA70 + Chl_2 + SST_2 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(16, 0),
+                      type = "relative",
+                      stat = c("mean", "min", "max", "sum"),
+                      func = c("quad", "lin"), # Model can't run with log or inv 
+                      cmissing = "method1")
+```
+
+### Results
+
+```{r}
+Comb = (ClimWin$combos) %>% rownames_to_column() %>% arrange((DeltaAICc)); as.data.frame(Comb)
+```
+
+
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+n = Comb %>% .[[1,1]] %>% as.numeric()
+tidy_stat = Comb %>% .[[1, 5]] %>% as.character()
+tidy_func = Comb %>% .[[1, 6]] %>% as.character()
+Results = ClimWin[[n]]$Dataset ; head(Results, n = 4)
+```
+```{r}
+plotdelta(dataset = Results)
+```
+#### Average results
+```{r}
+medwin(ClimWin[[n]]$Dataset) # calculate mean open window and mean close window from the best model base on the 95% confidence 
+
+dataset <- ClimWin[[n]]$Dataset
+
+ConfidenceSet <- dataset[which(cumsum(dataset$ModWeight) <= 0.95), ]
+
+sum(ConfidenceSet$ModelBeta*ConfidenceSet$ModWeight)
+```
+#### Extract data ReffitedAreaRain
+```{r}
+ClimVar = "RefittedAreaRain"
+ClimateData = ClimWin[[n]]$BestModelData; head(ClimateData)
+Area_RainData = ClimateData %>% select(contains("climate")) %>% rename(!!ClimVar := climate) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^2\\)")), ~ paste0(ClimVar, "_2")) %>% 
+  rename_if((str_detect(names(.), "I\\(climate\\^3\\)")), ~ paste0(ClimVar, "_3")) %>% 
+  bind_cols(Bio)
+write_csv(Area_RainData, str_glue("WinBodyCond{ClimVar}.csv"))
+```
+## Randomization
+```{r, message=FALSE, results=FALSE, warning=FALSE, cache=TRUE}
+ClimRand <- randwin(repeats = 15,
+                    xvar = list(ClimVar = Clim$Area_Rain),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70 ~ ULNA70 + Chl_2 + SST_2 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(10, 0),
+                    type = "relative",
+                    stat = tidy_stat,
+                    func = tidy_func,
+                    cmissing = "method1")
+```
+
+
+
+### Results of randomization
+```{r, fig.height = 5, fig.width = 8, fig.align="center"}
+ClimWinRand = ClimRand[[1]]
+
+# Diagnostic Plots
+
+pvalue(Results, ClimWinRand, metric = "C", sample.size = 16)
+
+plothist(Results, ClimWinRand)
+
+```
+
+
+
+
+## Weight Area_Rain
+```{r, eval=TRUE, cache=TRUE, results="hide", message=FALSE}
+# Bio_Scale <- Bio %>% mutate(across(c(HatchAsync, PROPORTIONALRANK, SST_2), scale))
+# Clim_Scale <- Clim %>% mutate(across(c(Chl), scale))
+dev.new(noRStudioGD = T)
+weight <- weightwin(n = 15,
+                    xvar = list(ClimVar = Clim$Area_Rain),
+                    cdate = Clim$Date,
+                    bdate = Bio$DATE,
+                    baseline = lmer(PESO70~ ULNA70 + Chl_2 + SST_2 + (1|WORKYEAR), REML = F, data = Bio),
+                    cinterval = "week",
+                    range = c(16, 0),
+                    type = "relative",
+                    func = tidy_func,
+                    weightfunc = "W",
+                    cmissing = "method1",
+                    par = c(3, 0.2, 0))
+```
+#### Weight Area_Rain results
+```{r}
+Weight_results <- weight$iterations %>% rownames_to_column() %>% arrange(deltaAICc); Weight_results # Show iteration results 
+n <- Weight_results[1, 1] %>% as.numeric()
+Best_iter <- weight[[n]]$WeightedOutput; Best_iter # Best model interation
+```
+
+
+```{r, warning=FALSE}
+plot(weight[[10]]$Weights, type = "line")
+```
+We need to compare the AIC from the slidingwin function and from the weightwin to see with function explain better the variation in brood reduction either a weight with uniform distribution or a weight with Weibull distribution. 
+Here we can se that the better model is with _..._ function
+
+### Randomization weight
+```{r, eval=TRUE, cache=TRUE, results="hide", message=FALSE}
+dev.new(noRStudioGD = T)
+WeightRand <- randwin(repeats = 15,
+                      window = "weighted",
+                      xvar = list(ClimVar = Clim$Area_Rain),
+                      cdate = Clim$Date,
+                      bdate = Bio$DATE,
+                      baseline = lmer(PESO70~ ULNA70 + Chl_2 + SST_2 + (1|WORKYEAR), REML = F, data = Bio),
+                      cinterval = "week",
+                      range = c(16, 0),
+                      type = "relative",
+                      func = tidy_func,
+                      cmissing = "method1",
+                      weightfunc = "W", par = c(3, 0.2, 0))
+
+```
+#### Results weight
+```{r}
+pvalue(dataset = weight[[n]]$WeightedOutput, datasetrand = WeightRand[[1]], metric = "AIC")
+```
+
+
+
+
+# Final compilation of data
+```{r, results=FALSE, message=FALSE}
+# Compile new data
+RefittedChl = read_csv("WinBodyCondRefittedChl.csv") %>% 
+  select(1:2, NIDO, WORKYEAR)
+RefittedSST = read_csv("WinBodyCondRefittedSST.csv") %>% 
+  select(1:2, NIDO, WORKYEAR)
+RefittedAreaRain = read_csv("WinBodyCondRefittedAreaRain.csv") %>% 
+  select(1:2, NIDO, WORKYEAR)
+
+
+NewMother = read_csv("ClimWinBodyCond_1.csv")
+
+FinalData = plyr::join_all(list(NewMother, RefittedChl, RefittedSST, RefittedAreaRain), 
+                           by = c("NIDO", "WORKYEAR"), 
+                           type = "left") %>% glimpse()
+write_csv(FinalData,("RefittedDATABodyCond_1.csv"))
+```
+
+
+
+
+
+
+
+
+
+# We need to add last reproductive effort from the mother
+
+```{r}
+FemaleCosts = read_csv(str_glue("C:/Users/{path}/Dropbox/PHD/DATA/Csv/DATAFemaleCosts.csv")) %>%
+  select(ANILLOHEMB, WORKYEAR, NIDO, LastParentalCare_ALL, LastParentalCare_Egg, LastParentalCare_Chick)
+RefitData = read_csv("RefittedDATABodyCond_1.csv")
+
+AddData = left_join(RefitData, FemaleCosts, by = c("ANILLOHEMB", "WORKYEAR", "NIDO"))
+write_csv(AddData, "FinalRefittedDATABodyCond_1.csv")
+```
+
+
+# Final Result for brood reduction and climatic and enviromental factors
+
+### Females
+```{r}
+FinalData = read_csv("RefittedDATABodyCond_1.csv") %>% 
+  mutate(across(c(WORKYEAR, ANILLOHEMB, ANILLOMACH), as.factor)) %>%
+  mutate_at(vars(RefittedSST, RefittedChl, RefittedAreaRain, ULNA70,
+                 AGEHEMB, AGEMACH, CoupleExpLocal,
+                 Cohabtime,
+                 PROPORTIONALRANK, CondCohabtime), arm::rescale)
+```
+
+
+```{r}
+# FinalData %>% names() %>% sort()  
+LmmData = FinalData %>% 
+  filter(CONFIRMHEMB == "TRUE") %>%
+  filter(!ANILLOHEMB == "SA") %>%
+  mutate(across(c(where(is.numeric), -PESO70, -Brood), ~scale(., center = T, scale = T))) %>%
+  select(WORKYEAR, Brood, PESO70, ULNA70, 
+         ANILLOHEMB, AGEHEMB,
+         CoupleExpLocal,
+         BodyCondSMI, 
+         CondCohabtime,
+         PROPORTIONALRANK, 
+         RefittedSST, RefittedChl, RefittedAreaRain) %>% na.omit() %>% as.data.frame() %>% 
+  glimpse()
+
+Lmm_full = lmer(PESO70 ~ ULNA70 +
+                  CondCohabtime + 
+                  PROPORTIONALRANK +
+                  RefittedChl +
+                  I(RefittedChl^2) +
+                  RefittedSST +
+                  I(RefittedSST^2) +
+                  RefittedAreaRain +
+                  I(RefittedAreaRain^2) +
+                  AGEHEMB +
+                  I(AGEHEMB^2) +
+                  CoupleExpLocal +
+                  (1|WORKYEAR) + (1|ANILLOHEMB),
+                na.action = "na.fail", REML = FALSE,
+                data = LmmData)
+
+sjPlot::tab_model(Lmm_full)
+
+Lmm_NULL <- update(Lmm_full, . ~ . -(1|ANILLOHEMB))
+AICtab(Lmm_full, Lmm_NULL) # keep female id as random effect
+```
+```{r}
+# Plot
+plot(allEffects(Lmm_full))
+```
+```{r}
+# Final results
+Summary <- summary(Lmm_full)
+FixCoef <- Summary$coefficients %>% as.data.frame() %>% rownames_to_column("Terms")
+RandCoef <- Summary$varcor %>% as.data.frame() %>% select(-var2) %>% rename(Terms = grp)
+CI <- confint(Lmm_full) %>% as.data.frame() %>% rownames_to_column("Terms")
+CoefTable <- CI %>% left_join(FixCoef, by = "Terms") %>% bind_rows(RandCoef)
+write_csv(CoefTable, "FemaleResults.csv")
+```
+
+### Male 
+```{r}
+# FinalData %>% names() %>% sort()  
+LmmData = FinalData %>% 
+  filter(CONFIRMMACH == "TRUE") %>%
+  filter(!ANILLOMACH == "SA") %>%
+  select(WORKYEAR, Brood, PESO70, ULNA70,
+         CondCohabtime,
+         ANILLOMACH, AGEMACH,
+         CoupleExpLocal,
+         BodyCondSMI, 
+         PROPORTIONALRANK, 
+         RefittedSST, RefittedChl, RefittedAreaRain) %>% na.omit() %>% as.data.frame() %>% 
+  glimpse()
+
+Lmm_full = lmer(PESO70 ~ ULNA70 +
+                  CondCohabtime + 
+                  PROPORTIONALRANK +
+                  RefittedChl +
+                  I(RefittedChl^2) +
+                  RefittedSST +
+                  I(RefittedSST^2) +
+                  RefittedAreaRain +
+                  I(RefittedAreaRain^2) +
+                  AGEMACH +
+                  I(AGEMACH^2) +
+                  CoupleExpLocal +
+                  (1|WORKYEAR) + (1|ANILLOMACH),
+                na.action = "na.fail", REML = FALSE,
+                data = LmmData)
+
+
+sjPlot::tab_model(Lmm_full)
+
+Lmm_NULL <- update(Lmm_full, . ~ . -(1|ANILLOMACH))
+AICtab(Lmm_full, Lmm_NULL) # keep male id as random effect
+
+```
+```{r}
+# Plot
+plot(allEffects(Lmm_full))
+```
+```{r}
+# Final results
+Summary <- summary(Lmm_full)
+FixCoef <- Summary$coefficients %>% as.data.frame() %>% rownames_to_column("Terms")
+RandCoef <- Summary$varcor %>% as.data.frame() %>% select(-var2) %>% rename(Terms = grp)
+CI <- confint(Lmm_full) %>% as.data.frame() %>% rownames_to_column("Terms")
+CoefTable <- CI %>% left_join(FixCoef, by = "Terms") %>% bind_rows(RandCoef)
+write_csv(CoefTable, "MaleResults.csv")
+```
+### Final
+```{r}
+# FinalData %>% names() %>% sort()  
+LmmData = FinalData %>% 
+    filter(CONFIRMHEMB == "TRUE") %>%
+  filter(!ANILLOHEMB == "SA") %>%
+  select(WORKYEAR, Brood, PESO70, ULNA70,
+         ANILLOHEMB,
+         CondCohabtime,
+         Brood,
+         # CoupleExpLocal,
+         BodyCondSMI, 
+         PROPORTIONALRANK, 
+         RefittedSST, RefittedChl, RefittedAreaRain) %>% na.omit() %>% as.data.frame() %>% 
+  glimpse()
+
+Sample_size <- LmmData %>% count()
+write_csv(Sample_size, "Sample_size.csv")
+Lmm_fullH = lmer(PESO70 ~ ULNA70 +
+                  Brood + 
+                  PROPORTIONALRANK +
+                  RefittedChl +
+                  I(RefittedChl^2) +
+                  RefittedSST +
+                  I(RefittedSST^2) +
+                  RefittedAreaRain +
+                  I(RefittedAreaRain^2) +
+                  # CoupleExpLocal +
+                  (1|WORKYEAR),
+                na.action = "na.fail", REML = FALSE,
+                data = LmmData)
+
+
+
+
+
+FinalData = read_csv("FinalRefittedDATABodyCond_1.csv") %>% glimpse()
+# FinalData %>% names() %>% sort()  
+LmmData = FinalData %>% 
+    filter(CONFIRMMACH == "TRUE") %>%
+  filter(!ANILLOMACH == "SA") %>%
+  # mutate(across(Brood, as.factor)) %>%
+   mutate_at(vars(RefittedSST, RefittedChl, RefittedAreaRain, ULNA70,
+                 AGEHEMB, AGEMACH, CoupleExpLocal,
+                 Cohabtime,
+                 PROPORTIONALRANK, CondCohabtime), arm::rescale) %>% 
+  select(WORKYEAR, Brood, PESO70, ULNA70,
+         ANILLOMACH,
+         CondCohabtime,
+         Brood,
+         CoupleExpLocal,
+         BodyCondSMI, 
+         PROPORTIONALRANK, 
+         RefittedSST, RefittedChl, RefittedAreaRain) %>% na.omit() %>% as.data.frame() %>% 
+  glimpse()
+
+Sample_size <- LmmData %>% count()
+write_csv(Sample_size, "Sample_size.csv")
+Lmm_fullM = lmer(PESO70 ~ ULNA70 +
+                  CondCohabtime + 
+                  PROPORTIONALRANK +
+                  RefittedChl +
+                  I(RefittedChl^2) +
+                  RefittedSST +
+                  I(RefittedSST^2) +
+                  RefittedAreaRain +
+                  I(RefittedAreaRain^2) +
+                  CoupleExpLocal +
+                  (1|WORKYEAR),
+                na.action = "na.fail", REML = FALSE,
+                data = LmmData)
+
+sjPlot::tab_model(Lmm_fullH)
+
+
+LmmNULLH <- update(Lmm_fullH, .~. + (1|ANILLOHEMB))
+LmmNULLM <- update(Lmm_fullM, .~. + (1|ANILLOMACH))
+
+
+AICtab(LmmNULLH, LmmNULLM, Lmm_fullH, Lmm_fullM, Lmm_full)
+AICtab(LmmNULLH, Lmm_fullH)
+```
+### Best Final model
+```{r}
+# FinalData %>% names() %>% sort()  
+LmmData = FinalData %>% 
+  #  filter(CONFIRMHEMB == "TRUE") %>%
+  # filter(!ANILLOHEMB == "SA") %>%
+  select(WORKYEAR, Brood, PESO70, ULNA70,
+         CondCohabtime,
+         # ANILLOHEMB,
+         Brood,
+         # CoupleExpLocal,
+         BodyCondSMI, 
+         PROPORTIONALRANK, 
+         RefittedSST, RefittedChl, RefittedAreaRain) %>% na.omit() %>% as.data.frame() %>% 
+  glimpse()
+
+Sample_size <- LmmData %>% count()
+write_csv(Sample_size, "Sample_size.csv")
+Lmm_full = lmer(PESO70 ~ ULNA70 +
+                  PROPORTIONALRANK +
+                  CondCohabtime + 
+                  RefittedChl +
+                  I(RefittedChl^2) +
+                  RefittedSST +
+                  I(RefittedSST^2) +
+                  RefittedAreaRain +
+                  I(RefittedAreaRain^2) +
+                  # CoupleExpLocal +
+                  (1|WORKYEAR),# + (1|ANILLOHEMB),
+                na.action = "na.fail", REML = FALSE,
+                data = LmmData)
+
+
+sjPlot::tab_model(Lmm_full)
+
+# Plot
+plot(allEffects(Lmm_full))
+```
+```{r}
+# Final results
+Summary <- summary(Lmm_full)
+FixCoef <- Summary$coefficients %>% as.data.frame() %>% rownames_to_column("Terms")
+RandCoef <- Summary$varcor %>% as.data.frame() %>% select(-var2) %>% rename(Terms = grp)
+CI <- confint(Lmm_full) %>% as.data.frame() %>% rownames_to_column("Terms")
+CoefTable <- CI %>% left_join(FixCoef, by = "Terms") %>% bind_rows(RandCoef)
+write_csv(CoefTable, "FinalResults.csv")
+```
+
+```{r}
+Predictors = c("Ulna", "Laying date", "Cohabitation time", "Chl", "Chl²","SST", "SST²","Rain", "Rain²")
+read.csv("FinalResults.csv") %>% select(-var1) %>% 
+  mutate(across(where(is.numeric), ~round(., digits = 2))) %>%
+  unite("IC", `X2.5..`:`X97.5..`, sep = " | ") %>% select(-vcov, -sdcor) %>%
+  dplyr::slice(c(-(1:3), -(13:14))) %>%
+  relocate(IC, .after = t.value) %>% 
+  mutate(Terms = Predictors) %>% 
+  kbl(col.names = c("Terms", "β", "SE", "Z", "IC"), align = c("l", "c", "c", "c", "c")) %>%
+  kable_classic(full_width = F, html_font = "Cambria") %>% 
+  add_header_above(c("Chick A body mass (n = 5355)" = 5)) %>% 
+  save_kable("FixMass_results.png", zoom = 10)
+
+read.csv("FinalResults.csv", row.names = 1) %>% select(-var1) %>% round(digits = 2) %>%
+  rownames_to_column("Random effects") %>% select(`Random effects`, sdcor, vcov) %>%
+  dplyr::slice(c(13)) %>%
+  kbl(col.names = c("Random effects", "σ", "σ²"), align = c("l", "c", "c")) %>%
+  kable_classic(full_width = F, html_font = "Cambria") %>% 
+  save_kable(file = "RandMass_results.png", zoom = 10)
+```
+
+
+## Select random effect
+```{r}
+# Lmm_null = lm(BodyCondSMI ~
+#                   PROPORTIONALRANK +
+#                   RefittedChl +
+#                   I(RefittedChl^2) +
+#                   RefittedWind +
+#                   I(RefittedWind^2) +
+#                   RefittedSST +
+#                   I(RefittedSST^2) +
+#                   AGEHEMB +
+#                   I(AGEHEMB^2) +
+#                   LastParentalCare_ALL +
+#                   # AGEMACH +
+#                   # I(AGEMACH^2) +
+#                   CoupleExpLocal,
+#                 data = LmmData)
+# Lmm_A = update(Lmm_full, . ~ . - (1|WORKYEAR))
+# Lmm_W = update(Lmm_full, . ~ . - (1|ANILLOHEMB))
+# ```
+# ```{r}
+# anova(Lmm_W, Lmm_full, refit = FALSE)
+# ```
+# ```{r}
+# anova(Lmm_A, Lmm_full, refit = FALSE)
+# ```
+# ```{r}
+# anova(Lmm_A, Lmm_W, refit = FALSE)
+```
+ANILLOHEMB as random effect is not needed
+
+
+## Model Selection
+```{r, eval=FALSE}
+drg = dredge(Lmm_full)
+head(drg, n = 10)
+delta2=get.models(drg,subset= delta < 2)
+summary(model.avg(delta2))
+```
+```{r, eval=FALSE}
+one=get.models(drg,subset= 1);sjPlot::tab_model(one)
+```
